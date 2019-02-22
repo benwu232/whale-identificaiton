@@ -8,6 +8,8 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+models
+tmp
 build/
 develop-eggs/
 dist/
@@ -102,3 +104,5 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+.csv
