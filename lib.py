@@ -19,6 +19,8 @@
 
 from fastai.conv_learner import *
 from fastai.dataset import *
+from fastai.sgdr import Callback
+
 
 import pandas as pd
 import numpy as np
@@ -285,6 +287,104 @@ class FilesDataset_single(FilesDataset):
     def get_n(self): return len(self.fnames)
 
 
+class FileDs(FilesDataset):
+    def __init__(self, data, path, transform):
+        df = data.copy()
+        counts = Counter(df.Id.values)
+        df['c'] = df['Id'].apply(lambda x: counts[x])
+        # in the production runs df.c>1 should be used
+        fnames = df[(df.c > 2) & (df.Id != 'new_whale')].Image.tolist()
+        df['label'] = df.Id
+        df.loc[df.c == 1, 'label'] = 'new_whale'
+        df = df.sort_values(by=['c'])
+        df.label = pd.factorize(df.label)[0]
+        l1 = 1 + df.label.max()
+        l2 = len(df[df.label == 0])
+        df.loc[df.label == 0, 'label'] = range(l1, l1 + l2)  # assign unique ids
+        self.labels = df.copy().set_index('Image')
+        self.names = df.copy().set_index('label')
+        if path == TRAIN:
+            # data augmentation: 8 degree rotation, 10% stratch, shear
+            tfms_g = [iaa.Affine(rotate=(-8, 8), mode='reflect',
+                                 scale={"x": (0.9, 1.1), "y": (0.9, 1.1)}, shear=(-16, 16))]
+            # data augmentation: horizontal flip, hue and staturation augmentation,
+            # gray scale, blur
+            tfms_px = [iaa.Fliplr(0.5), iaa.AddToHueAndSaturation((-20, 20)),
+                       iaa.Grayscale(alpha=(0.0, 1.0)), iaa.GaussianBlur((0, 1.0))]
+            self.loader = Loader(path, tfms_g, tfms_px)
+        else:
+            self.loader = Loader(path)
+        self.selection = None
+        super().__init__(fnames, transform, path)
+
+    def get_x(self, i):
+        label = self.labels.loc[self.fnames[i], 'label']
+        imgs = [self.loader(os.path.join(self.path, self.fnames[i])), label]
+        return imgs
+
+    def get_y(self, i):
+        return 0
+
+    def get(self, tfm, x, y):
+        if tfm is None:
+            return (*x, 0)
+        else:
+            x1, y1 = tfm(x[0], x[1])
+            return x1, y1
+
+    def get_names(self, label):
+        names = []
+        for j in range(10):
+            try:
+                names = self.names.loc[label].Image
+                break
+            except:
+                None
+        return names
+
+    @property
+    def is_multi(self):
+        return True
+
+    @property
+    def is_reg(self):
+        return True
+
+    def get_c(self):
+        return n_embedding
+
+    def get_n(self):
+        return len(self.fnames)
+
+
+class FileDs1(FilesDataset):
+    def __init__(self, data, path, transform):
+        self.loader = Loader(path)
+        #fnames = os.listdir(path)
+        if data is None:
+            fnames = sorted(list(Path(path).glob('*.jpg')))
+        elif isinstance(data, pd.DataFrame):
+            fnames = sorted(data.Image.to_list())
+        elif isinstance(data, list):
+            fnames = sorted(data)
+        super().__init__(fnames, transform, path)
+
+    def get_x(self, i):
+        return self.loader(os.path.join(self.path, self.fnames[i]))
+
+    def get_y(self, i):
+        return 0
+
+    @property
+    def is_multi(self): return True
+
+    @property
+    def is_reg(self): return True
+
+    def get_c(self): return n_embedding
+
+    def get_n(self): return len(self.fnames)
+
 # In[13]:
 
 def get_data(sz, bs, fname_emb=None, model=None):
@@ -303,6 +403,79 @@ def get_data(sz, bs, fname_emb=None, model=None):
     return md
 
 
+def build_data(sz, bs, trn_df, val_df):
+    tfms = tfms_from_model(resnet34, sz, crop_type=CropType.NO)
+    tfms[0].tfms = [tfms[0].tfms[2], tfms[0].tfms[3]]
+    tfms[1].tfms = [tfms[1].tfms[2], tfms[1].tfms[3]]
+    #ds = ImageData.get_ds(FileDs1, (trn_df, TRAIN), (val_df, TRAIN), tfms, test=(None, TEST))
+    #md = ImageData(PATH, ds, bs, num_workers=nw, classes=None)
+
+    ds = ImageData.get_ds(FileDs, (trn_df, TRAIN), (val_df, TRAIN), tfms)
+    md = ImageData(PATH, ds, bs, num_workers=nw, classes=None)
+
+    #if fname_emb != None and model != None:
+    #    print('selecting samples')
+    #    emb = pd.read_csv(fname_emb)
+    #    md.trn_dl.dataset.selection = Image_selection(md.trn_dl.dataset.fnames, trn_df, emb, model)
+    #    md.val_dl.dataset.selection = Image_selection(md.val_dl.dataset.fnames, val_df, emb, model)
+    return md
+
+
+
+class CbSoup(Callback):
+    def __init__(self, learn):
+        super().__init__()
+        self.learn = learn
+        self.val_labels = []
+        for k, fname in enumerate(self.learn.data.val_ds.fnames):
+            self.val_labels.append(self.learn.data.val_ds.labels.loc[fname, 'label'])
+
+        #self.batch_size = self.learn.data.train_dl.batch_size
+
+    #def on_epoch_end(self, none) -> None:
+    def on_batch_end(self, none) -> None:
+        print('soup in')
+
+        wrong_fnames = find_wrong_files(self.learn.model, self.learn.data.val_dl, self.learn.data.val_ds, self.val_labels)
+        self.learn.data = build_data(sz, bs, trn_df, val_df)
+
+        return wrong_fnames
+
+def find_wrong_files(model, dl, ds, labels):
+    emb, names = cal_emb(model, dl)
+    emb_size = emb.shape[0]
+    metric_list = []
+    model.eval()
+    with torch.no_grad():
+        for k in (range(emb_size)):
+            emb_row = emb[k].expand((*(emb.shape)))
+            metric = model.get_d(emb_row, emb)
+            metric_list.append(metric.view(-1))
+    metrics = torch.stack(metric_list)
+
+    sorted, indices = torch.topk(metrics, 64, dim=1, largest=False)
+    wrong_idxes = []
+    for k in range(emb_size):
+        for i in range(64):
+            if i == k:
+                continue
+            if labels[k] != labels[indices[k, i]]:
+                #wrong_fnames.append(self.learn.data.val_ds.fnames[indices[k, i]])
+                wrong_idxes.append(indices[k, i].item())
+                wrong_idxes.append(k)
+            else:
+                break
+
+    #emb, names = cal_emb(self.learn.model, self.learn.data.trn_dl)
+    wrong_idxes = list(set(wrong_idxes))
+    wrong_fnames = []
+    for k in wrong_idxes:
+        #print(len(wrong_idxes), k)
+        wrong_fnames.append(ds.fnames[k])
+
+    return wrong_fnames
+        
+ 
 # The image below demonstrates an example of triplets of rectangular 576x192 augmented images used for training. To be honest, some of those triplets are quite hard, and I don't think that I could even reach the same performance as the model after training (~99% accuracy in identifications of 2 similar images in a triplet). 
 
 # In[14]:
@@ -334,12 +507,13 @@ class Metric(nn.Module):
     def __init__(self, emb_sz=64):
         super().__init__()
         self.l = nn.Linear(emb_sz * 2, emb_sz * 2, False)
+        self.fc = nn.Linear(emb_sz * 2, 1)
 
     def forward(self, d):
         d2 = d.pow(2)
         d = self.l(torch.cat((d, d2), dim=-1))
-        x = d.pow(2).sum(dim=-1)
-        return x.view(-1)
+        logits = self.fc(d)
+        return torch.sigmoid(logits)
 
 
 # In[16]:
@@ -480,20 +654,16 @@ class TripletDenseNet121(nn.Module):
         self.n_slice = 16
 
     def forward(self, x):
-        z = x.view(-1, *x.shape[2:])
-        x = self.head(self.cnn(z))
-
-        #x1, x2, x3 = x[:, 0, :, :, :], x[:, 1, :, :, :], x[:, 2, :, :, :]
-        #x1 = self.head(self.cnn(x1))
-        #x2 = self.head(self.cnn(x2))
-        #x3 = self.head(self.cnn(x3))
-        #x = torch.cat((x1, x2, x3))
+        #z = x.view(-1, *x.shape[2:])
+        x = self.head(self.cnn(x))
         sz = x.shape[0]
         x1 = x.unsqueeze(1).expand((sz, sz, -1))
         x2 = x1.transpose(0, 1)
         # matrix of all vs all differencies
-        d = (x1 - x2).view(sz * sz, -1)
-        return self.metric(d)
+        #d = (x1 - x2).view(sz * sz, -1)
+        #return self.metric(d)
+        metric = self.metric(x1-x2).view((sz, sz))
+        return metric
 
     def get_embedding(self, x):
         return self.head(self.cnn(x))
@@ -501,6 +671,7 @@ class TripletDenseNet121(nn.Module):
     def get_d(self, x0, x):
         d = (x - x0)
         return self.metric(d)
+
 
 
 class DenseNet121Model():
@@ -520,6 +691,37 @@ class DenseNet121Model():
 # I my tests I have performed a comparison of several loss functions and found that contrastive loss works the best in the current setup. I also, in comparison with the previous version, select only nonzero terms when perform averaging. I found that at a later stage of training many pairs are already well separated and contribute zero to gradients while decrease the magnitude of useful gradients during averaging. The drawback of such an approach is that during training **values of train and validation loss must be ignored, since they are calculated each time based on different number of pairs**, and only the value of metric (like accuracy of identifying a correct pair of images with the same label in a triplet, T_acc, or accuracy of identifying a correct pair of images with the same label within a hardest triplet in batch for each anchor image, BH_acc) must be tracked. However, after performing mining hardest negative examples, even accuracy metrics are not reliable, and the only way to check performance of the model is validation based on the entire validation dataset rather than batches with using the same metric as one in the competition. To prevent predictions being spread too much in the embedding space, which deteriorates generalization, in the V9 of the kernel I added a compactificcation term to the loss that boosted the score from **0.74 to ~0.78** and stopped unstable behaviour of val loss.
 
 # In[19]:
+
+class BinaryLoss(nn.Module):
+    def __init__(self, wd=1e-4):
+        super().__init__()
+        self.wd =  wd
+
+    def forward(self, d, target):
+        #d = d.float()
+        d = d.view(-1)
+        # matrix of all vs all comparisons
+        #t = torch.cat(target)
+        t = target
+        sz = t.shape[0]
+        t1 = t.unsqueeze(1).expand((sz, sz))
+        t2 = t1.transpose(0, 1)
+        y = ((t1 != t2) + to_gpu(torch.eye(sz).byte())).view(-1)
+
+        loss_p = None
+        if len(y[y==0]):
+            loss_p = F.binary_cross_entropy(d[y==0], y[y==0].float())
+
+        loss_n = None
+        if len(y[y==1]):
+            loss_n = F.binary_cross_entropy(d[y==1], y[y==1].float())
+
+        if loss_p is None:
+            return loss_n
+
+        loss = (loss_p + loss_n) / 2
+        return loss
+
 
 class Contrastive_loss(nn.Module):
     def __init__(self, m=10.0, wd=1e-4):
@@ -664,6 +866,20 @@ def extract_embedding(model, path):
             preds[start:start + size, :] = m.get_embedding(x.half())
             start += size
         return preds, [os.path.basename(name) for name in md.test_dl.dataset.fnames]
+
+def cal_emb(model, dl):
+    model.eval()
+    with torch.no_grad():
+        preds = torch.zeros((len(dl.dataset), n_embedding))
+        start = 0
+        # for i, (x,y) in tqdm_notebook(enumerate(md.test_dl,start=0), total=len(md.test_dl)):
+        for i, (x, y) in tqdm(enumerate(dl, start=0), total=len(dl)):
+            #print(i)
+            size = x.shape[0]
+            m = model.module if isinstance(model, FP16) else model
+            preds[start:start + size, :] = m.get_embedding(x)
+            start += size
+        return preds, [os.path.basename(name) for name in dl.dataset.fnames]
 
 
 # ### **Validation**

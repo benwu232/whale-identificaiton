@@ -33,18 +33,21 @@ from imgaug import augmenters as iaa
 from lib import *
 
 lr = 1e-3
-lrs = np.array([lr / 25, lr / 5, lr, lr])
+lrs = np.array([lr / 100, lr / 10, lr, lr])
 
 drop_rate = 0.5
 fine_tuning = 0
 
-md = get_data(sz, bs)
+df = pd.read_csv(LABELS)
+trn_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+md = build_data(sz, bs, trn_df, val_df)
 
 x, y = next(iter(md.trn_dl))
 print(x.shape, y[0].shape)
 
 to_lb = md.trn_ds.names.Id.to_dict()
-lbs = [[to_lb[idx] for idx in y_cur.tolist()] for y_cur in y]
+#lbs = [[to_lb[idx] for idx in y_cur.tolist()] for y_cur in y]
+lbs = [to_lb[idx] for idx in y.tolist()]
 # display_imgs((md.trn_ds.denorm(x[:,0,:,:,:]),md.trn_ds.denorm(x[:,1,:,:,:]),              md.trn_ds.denorm(x[:,2,:,:,:])),lbs)
 
 
@@ -55,10 +58,13 @@ lbs = [[to_lb[idx] for idx in y_cur.tolist()] for y_cur in y]
 learner = ConvLearner(md, DenseNet121Model(ps=drop_rate, emb_sz=n_embedding))
 learner.opt_fn = optim.Adam
 learner.clip = 1.0  # gradient clipping
-learner.crit = Contrastive_loss(m=contrastive_neg_margin)
-learner.metrics = [T_acc, BH_acc, pp_dist_max, pn_dist_min]
+#learner.crit = Contrastive_loss(m=contrastive_neg_margin)
+learner.crit = BinaryLoss()
+#learner.metrics = [T_acc, BH_acc, pp_dist_max, pn_dist_min]
 learner.freeze_to(-2)  # unfreez metric and head block
 learner  # click "output" to see details of the model
+learner.train_df = trn_df
+learner.val_df = val_df
 
 # First, I train only the fully connected part of the model and the metric while keeping the rest frozen. It allows to avoid corruption of the pretrained weights at the initial stage of training due to random initialization of the head layers. So the power of transfer learning is fully utilized when the training is continued.
 
@@ -67,10 +73,11 @@ learner  # click "output" to see details of the model
 #learner.half()
 #md = get_data(sz, bs, 'train_emb.csv', learner.model)
 
+cb_soup = CbSoup(learner)
 if not fine_tuning:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        learner.fit(lr, 3)
+        learner.fit(lr, 3, callbacks=[cb_soup])
 
     learner.unfreeze()  # unfreeze entire model
     learner.half()  # half precision
