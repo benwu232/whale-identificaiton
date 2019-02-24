@@ -46,10 +46,56 @@ contrastive_neg_margin = 10.0
 n_embedding = 512
 #bs = 32
 bs = 5
-bs = 26
+bs = 40
 sz = 384 # increase the image size at the later stage of training
 sz = 224  # increase the image size at the later stage of training
 nw = 6
+
+new_whale_id = 'z_new_whale'
+
+import datetime as dt
+def now2str(format="%Y-%m-%d_%H-%M-%S"):
+    #str_time = time.strftime("%Y-%b-%d-%H-%M-%S", time.localtime(time.time()))
+    return dt.datetime.now().strftime(format)
+
+def change_new_whale(df, new_name='z_new_whale'):
+    for k in range(len(df)):
+        if df.at[k, 'Id'] == 'new_whale':
+            df.at[k, 'Id'] = new_name
+
+def split_whale_set(df, nth_fold=0, total_folds=5, new_whale_method=0, seed=1, new_whale_id='z_new_whale'):
+    '''
+    Split whale dataset to train and valid set based on k-fold idea.
+    total_folds: number of total folds
+    nth_fold: the nth fold
+    new_whale_method: If 0, remove new_whale in all data sets; if 1, add new_whale to train/validation sets
+    seed: Random seed for shuffling
+    '''
+    np.random.seed(seed)
+    # list(df_known.groupby('Id'))
+    train_list = []
+    val_list = []
+    # df_known = df[df.Id!='new_whale']
+    for name, group in df.groupby('Id'):
+        # print(name, len(group), group.index, type(group))
+        # if name == 'w_b82d0eb':
+        #    print(name, df_known[df_known.Id==name])
+        if new_whale_method == 0 and name == new_whale_id:
+            continue
+        group_num = len(group)
+        images = group.Image.values
+        if group_num > 1:
+            np.random.shuffle(images)
+            # images = list(images)
+            span = max(1, group_num // total_folds)
+            val_images = images[nth_fold * span:(nth_fold + 1) * span]
+            train_images = list(set(images) - set(val_images))
+            val_list.extend(val_images)
+            train_list.extend(train_images)
+        else:
+            train_list.extend(images)
+
+    return train_list, val_list
 
 
 # ### **Data**
@@ -288,21 +334,10 @@ class FilesDataset_single(FilesDataset):
 
 
 class FileDs(FilesDataset):
-    def __init__(self, data, path, transform):
-        df = data.copy()
-        counts = Counter(df.Id.values)
-        df['c'] = df['Id'].apply(lambda x: counts[x])
-        # in the production runs df.c>1 should be used
-        fnames = df[(df.c > 2) & (df.Id != 'new_whale')].Image.tolist()
-        df['label'] = df.Id
-        df.loc[df.c == 1, 'label'] = 'new_whale'
-        df = df.sort_values(by=['c'])
-        df.label = pd.factorize(df.label)[0]
-        l1 = 1 + df.label.max()
-        l2 = len(df[df.label == 0])
-        df.loc[df.label == 0, 'label'] = range(l1, l1 + l2)  # assign unique ids
-        self.labels = df.copy().set_index('Image')
-        self.names = df.copy().set_index('label')
+    def __init__(self, data, path, transform, df0):
+        self.fnames = data
+        self.df0 = df0
+        self.file2label = df0.set_index('Image')
         if path == TRAIN:
             # data augmentation: 8 degree rotation, 10% stratch, shear
             tfms_g = [iaa.Affine(rotate=(-8, 8), mode='reflect',
@@ -315,10 +350,10 @@ class FileDs(FilesDataset):
         else:
             self.loader = Loader(path)
         self.selection = None
-        super().__init__(fnames, transform, path)
+        super().__init__(self.fnames, transform, path)
 
     def get_x(self, i):
-        label = self.labels.loc[self.fnames[i], 'label']
+        label = self.file2label.loc[self.fnames[i], 'label']
         imgs = [self.loader(os.path.join(self.path, self.fnames[i])), label]
         return imgs
 
@@ -403,14 +438,14 @@ def get_data(sz, bs, fname_emb=None, model=None):
     return md
 
 
-def build_data(sz, bs, trn_df, val_df):
+def build_data(sz, bs, train_list, val_list, df0):
     tfms = tfms_from_model(resnet34, sz, crop_type=CropType.NO)
     tfms[0].tfms = [tfms[0].tfms[2], tfms[0].tfms[3]]
     tfms[1].tfms = [tfms[1].tfms[2], tfms[1].tfms[3]]
     #ds = ImageData.get_ds(FileDs1, (trn_df, TRAIN), (val_df, TRAIN), tfms, test=(None, TEST))
     #md = ImageData(PATH, ds, bs, num_workers=nw, classes=None)
 
-    ds = ImageData.get_ds(FileDs, (trn_df, TRAIN), (val_df, TRAIN), tfms)
+    ds = ImageData.get_ds(FileDs, (train_list, TRAIN), (val_list, TRAIN), tfms, df0=df0)
     md = ImageData(PATH, ds, bs, num_workers=nw, classes=None)
 
     #if fname_emb != None and model != None:
@@ -421,27 +456,50 @@ def build_data(sz, bs, trn_df, val_df):
     return md
 
 
+def idx2label(ds):
+    labels = []
+    for k, fname in enumerate(ds.fnames):
+        labels.append(ds.file2label.loc[fname, 'label'])
+    return labels
 
-class CbSoup(Callback):
+
+class CbBoost(Callback):
     def __init__(self, learn):
         super().__init__()
         self.learn = learn
-        self.val_labels = []
-        for k, fname in enumerate(self.learn.data.val_ds.fnames):
-            self.val_labels.append(self.learn.data.val_ds.labels.loc[fname, 'label'])
+        self.train_labels = idx2label(self.learn.data.trn_ds)
+        self.val_labels = idx2label(self.learn.data.val_ds)
 
-        #self.batch_size = self.learn.data.train_dl.batch_size
+    def on_epoch_end(self, none) -> None:
+    #def on_batch_end(self, none) -> None:
+        print('************************************* Boosting ****************************************')
+        print(now2str())
+        print('Calculating map5 in validation set ...')
+        if 1:
+            met_mat = cal_ds_metrics(self.learn.model, self.learn.data.val_dl)
+        else:
+            with open('metmat.dump', 'rb') as f:
+                met_mat = pickle.load(f)
+        map5 = cal_map_score(met_mat, self.val_labels, threshold=0.7)
+        print(f'Validation set, map5 = {map5}')
 
-    #def on_epoch_end(self, none) -> None:
-    def on_batch_end(self, none) -> None:
-        print('soup in')
+        print(now2str())
+        print('Finding wrong images in train set ... ')
+        if 1:
+            met_mat = cal_ds_metrics(self.learn.model, self.learn.data.trn_dl)
+        else:
+            with open('metmat_trn.dump', 'rb') as f:
+                met_mat = pickle.load(f)
+        wrong_fnames = find_wrong_files(met_mat, self.learn.data.trn_ds, self.train_labels)
+        self.learn.data_ = build_data(sz, bs, wrong_fnames, self.learn.val_list, df0=self.learn.df0)
+        print(now2str())
+        with open('wrong_imgs.dump', 'wb') as f:
+            pickle.dump(wrong_fnames, f)
+        print(f'Found {len(wrong_fnames)} wrong images.')
 
-        wrong_fnames = find_wrong_files(self.learn.model, self.learn.data.val_dl, self.learn.data.val_ds, self.val_labels)
-        self.learn.data = build_data(sz, bs, trn_df, val_df)
 
-        return wrong_fnames
 
-def find_wrong_files(model, dl, ds, labels):
+def cal_ds_metrics(model, dl):
     emb, names = cal_emb(model, dl)
     emb_size = emb.shape[0]
     metric_list = []
@@ -452,26 +510,63 @@ def find_wrong_files(model, dl, ds, labels):
             metric = model.get_d(emb_row, emb)
             metric_list.append(metric.view(-1))
     metrics = torch.stack(metric_list)
+    return metrics
 
-    sorted, indices = torch.topk(metrics, 64, dim=1, largest=False)
-    wrong_idxes = []
-    for k in range(emb_size):
-        for i in range(64):
-            if i == k:
+def cal_map_score(met_mat, labels, mapn=5, threshold=0.7):
+    new_whale_label = 5004
+    sorted, indices = torch.topk(met_mat, 64, dim=1, largest=False)
+    col_len, row_len = met_mat.shape
+    scores = np.zeros(col_len)
+    for idx in range(col_len):
+        ref_label = labels[idx]
+        cnt = 0
+        score = 0.0
+        for k in range(row_len):
+            cur_k = indices[idx, k]
+            cur_value = sorted[idx, k]
+            if cur_k == idx:
                 continue
-            if labels[k] != labels[indices[k, i]]:
+
+            cur_label = labels[cur_k]
+            if cur_value > threshold:
+                cur_label = new_whale_label
+
+            if ref_label == cur_label:
+                score = 1.0 / (cnt + 1)
+                break
+            else:
+                cnt += 1
+                if cnt >= mapn:
+                    break
+        scores[idx] = score
+    return scores.mean()
+
+def find_wrong_files(met_mat, ds, labels):
+    #metrics = cal_ds_metrics(model, dl)
+    sorted, indices = torch.topk(met_mat, 64, dim=1, largest=False)
+    col_len, row_len = sorted.shape
+    wrong_idxes = []
+    for idx in range(col_len):
+        ref_label = labels[idx]
+        for k in range(row_len):
+            cur_k = indices[idx, k]
+            if cur_k == idx:
+                continue
+
+            cur_label = labels[cur_k]
+            if cur_label != ref_label:
                 #wrong_fnames.append(self.learn.data.val_ds.fnames[indices[k, i]])
-                wrong_idxes.append(indices[k, i].item())
-                wrong_idxes.append(k)
+                wrong_idxes.append(cur_k.item())
+                wrong_idxes.append(idx)
             else:
                 break
 
     #emb, names = cal_emb(self.learn.model, self.learn.data.trn_dl)
     wrong_idxes = list(set(wrong_idxes))
     wrong_fnames = []
-    for k in wrong_idxes:
+    for idx in wrong_idxes:
         #print(len(wrong_idxes), k)
-        wrong_fnames.append(ds.fnames[k])
+        wrong_fnames.append(ds.fnames[idx])
 
     return wrong_fnames
         
@@ -872,8 +967,8 @@ def cal_emb(model, dl):
     with torch.no_grad():
         preds = torch.zeros((len(dl.dataset), n_embedding))
         start = 0
-        # for i, (x,y) in tqdm_notebook(enumerate(md.test_dl,start=0), total=len(md.test_dl)):
-        for i, (x, y) in tqdm(enumerate(dl, start=0), total=len(dl)):
+        #for i, (x, y) in tqdm(enumerate(dl, start=0), total=len(dl)):
+        for i, (x, y) in enumerate(dl):
             #print(i)
             size = x.shape[0]
             m = model.module if isinstance(model, FP16) else model

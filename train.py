@@ -36,12 +36,24 @@ lr = 1e-3
 lrs = np.array([lr / 100, lr / 10, lr, lr])
 
 drop_rate = 0.5
-fine_tuning = 0
+fine_tuning = 1
 
-df = pd.read_csv(LABELS)
-trn_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
-md = build_data(sz, bs, trn_df, val_df)
+df0 = pd.read_csv(LABELS)
+change_new_whale(df0, new_whale_id)
 
+train_list, val_list = split_whale_set(df0, nth_fold=0, new_whale_method=1, seed=1, new_whale_id=new_whale_id)
+train_list_nnw, val_list_nnw = split_whale_set(df0, nth_fold=0, new_whale_method=0, seed=1, new_whale_id=new_whale_id)
+
+le = sklearn.preprocessing.LabelEncoder()
+le.fit(df0.Id)
+df0['label'] = le.transform(df0.Id)
+
+file2label = df0.set_index('Image')
+
+
+#trn_df, val_df = train_test_split(df, test_size=0.2, random_state=42)
+md = build_data(sz, bs, train_list, val_list, df0=df0)
+'''
 x, y = next(iter(md.trn_dl))
 print(x.shape, y[0].shape)
 
@@ -49,6 +61,7 @@ to_lb = md.trn_ds.names.Id.to_dict()
 #lbs = [[to_lb[idx] for idx in y_cur.tolist()] for y_cur in y]
 lbs = [to_lb[idx] for idx in y.tolist()]
 # display_imgs((md.trn_ds.denorm(x[:,0,:,:,:]),md.trn_ds.denorm(x[:,1,:,:,:]),              md.trn_ds.denorm(x[:,2,:,:,:])),lbs)
+'''
 
 
 # ### **Training**
@@ -63,8 +76,9 @@ learner.crit = BinaryLoss()
 #learner.metrics = [T_acc, BH_acc, pp_dist_max, pn_dist_min]
 learner.freeze_to(-2)  # unfreez metric and head block
 learner  # click "output" to see details of the model
-learner.train_df = trn_df
-learner.val_df = val_df
+learner.train_list = train_list
+learner.val_list = val_list
+learner.df0 = df0
 
 # First, I train only the fully connected part of the model and the metric while keeping the rest frozen. It allows to avoid corruption of the pretrained weights at the initial stage of training due to random initialization of the head layers. So the power of transfer learning is fully utilized when the training is continued.
 
@@ -73,129 +87,87 @@ learner.val_df = val_df
 #learner.half()
 #md = get_data(sz, bs, 'train_emb.csv', learner.model)
 
-cb_soup = CbSoup(learner)
+cb_boost = CbBoost(learner)
 if not fine_tuning:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        learner.fit(lr, 3, callbacks=[cb_soup])
+        learner.fit(lr, 3, callbacks=[cb_boost])
+        model_file = 'model0'
+        print(f'saving {model_file}')
+        learner.save(model_file)
+else:
+    learner.load('model0')
 
+if 1:
     learner.unfreeze()  # unfreeze entire model
-    learner.half()  # half precision
+    #learner.half()  # half precision
 
     # **Since the loss is calculated as an average of nonzero terms, as mentioned above, it's value is not relaiable and must be ignored.** Instead the values of T_acc and BH_acc metrics should be considered.
 
     # In[ ]:
 
+    n_cycle = 3
+    cycle_len = 2
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        learner.fit(lrs / 2, 2, cycle_len=1, use_clr=(10, 20))
-        learner.save('model1')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 2, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model1'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 4, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model2')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 2, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model2'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 4, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model3')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 4, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model3'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 4, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model4')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 4, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model4'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 8, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model5')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 8, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model5'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 8, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model6')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 8, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model6'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 8, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model7')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 16, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model7'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 16, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model8')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 16, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model8'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 16, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model9')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 32, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model9'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 32, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model10')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 32, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model10'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 32, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model11')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
+        learner.fit(lrs / 64, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model11'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-# In[ ]:
+        learner.fit(lrs / 64, n_cycle, cycle_len=cycle_len, use_clr=(10, 20), callbacks=[cb_boost])
+        model_file = 'model12'
+        print(f'saving {model_file}')
+        learner.save(model_file)
 
-if fine_tuning:
-    print('fine tuning ...')
-    model_file = 'model2'
-    print(f'loading model {model_file}')
-    learner.load(model_file)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-
-        learner.unfreeze()
-        #learner.half()
-        #md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 16, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model20')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
-
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 16, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model21')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
-
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 32, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('mode22')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
-
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 32, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model23')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
-
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 64, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model24')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
-
-        learner.half()
-        md = get_data(sz, bs, 'train_emb.csv', learner.model)
-        learner.fit(lrs / 64, 2, cycle_len=2, use_clr=(10, 20))
-        learner.save('model25')
-        emb2file(learner.model, TRAIN, 'train_emb.csv')
 
