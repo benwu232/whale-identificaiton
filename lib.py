@@ -19,6 +19,8 @@
 
 from fastai.conv_learner import *
 from fastai.dataset import *
+from fastai.sgdr import Callback
+
 
 import pandas as pd
 import numpy as np
@@ -44,10 +46,56 @@ contrastive_neg_margin = 10.0
 n_embedding = 512
 #bs = 32
 bs = 5
-bs = 26
+bs = 13
 sz = 384 # increase the image size at the later stage of training
 sz = 224  # increase the image size at the later stage of training
 nw = 6
+
+new_whale_id = 'z_new_whale'
+
+import datetime as dt
+def now2str(format="%Y-%m-%d_%H-%M-%S"):
+    #str_time = time.strftime("%Y-%b-%d-%H-%M-%S", time.localtime(time.time()))
+    return dt.datetime.now().strftime(format)
+
+def change_new_whale(df, new_name='z_new_whale'):
+    for k in range(len(df)):
+        if df.at[k, 'Id'] == 'new_whale':
+            df.at[k, 'Id'] = new_name
+
+def split_whale_set(df, nth_fold=0, total_folds=5, new_whale_method=0, seed=1, new_whale_id='z_new_whale'):
+    '''
+    Split whale dataset to train and valid set based on k-fold idea.
+    total_folds: number of total folds
+    nth_fold: the nth fold
+    new_whale_method: If 0, remove new_whale in all data sets; if 1, add new_whale to train/validation sets
+    seed: Random seed for shuffling
+    '''
+    np.random.seed(seed)
+    # list(df_known.groupby('Id'))
+    train_list = []
+    val_list = []
+    # df_known = df[df.Id!='new_whale']
+    for name, group in df.groupby('Id'):
+        # print(name, len(group), group.index, type(group))
+        # if name == 'w_b82d0eb':
+        #    print(name, df_known[df_known.Id==name])
+        if new_whale_method == 0 and name == new_whale_id:
+            continue
+        group_num = len(group)
+        images = group.Image.values
+        if group_num > 1:
+            np.random.shuffle(images)
+            # images = list(images)
+            span = max(1, group_num // total_folds)
+            val_images = images[nth_fold * span:(nth_fold + 1) * span]
+            train_images = list(set(images) - set(val_images))
+            val_list.extend(val_images)
+            train_list.extend(train_images)
+        else:
+            train_list.extend(images)
+
+    return train_list, val_list
 
 
 # ### **Data**
@@ -109,8 +157,10 @@ def get_idxs0(names, df, n=64):
 
 
 class Image_selection:
-    def __init__(self, fnames, data, emb_df=None, model=None):
+    def __init__(self, fnames, df0, emb_df=None, model=None):
         if emb_df is None or model is None:
+            df = df0[df0.Image]
+            '''
             df = data.copy()  # .set_index('Image')
             counts = Counter(df.Id.values)
             df['c'] = df['Id'].apply(lambda x: counts[x])
@@ -122,12 +172,14 @@ class Image_selection:
             l2 = len(df[df.label == 0])
             df.loc[df.label == 0, 'label'] = range(l1, l1 + l2)  # assign unique ids
             df = df.set_index('label')
+            '''
+            df_label = df0.set_index('label')
             l = len(fnames)
-            idxs = Parallel(n_jobs=nw)(delayed(get_idxs0)(fnames[int(i * l / nw):int((i + 1) * l / nw)], df) for i in range(nw))
+            idxs = Parallel(n_jobs=nw)(delayed(get_idxs0)(fnames[int(i * l / nw):int((i + 1) * l / nw)], df_label) for i in range(nw))
             idxs = [y for x in idxs for y in x]
             pass
         else:
-            data = data.copy().set_index('Image')
+            data = df0.copy().set_index('Image')
             trn_emb = emb_df.copy()
             trn_emb.set_index('files', inplace=True)
             trn_emb['emb'] = [[float(i) for i in s.split()] for s in trn_emb['emb']]
@@ -165,8 +217,15 @@ class Image_selection:
 # In[12]:
 
 class pdFilesDataset(FilesDataset):
-    def __init__(self, data, path, transform):
-        df = data.copy()
+    def __init__(self, data, path, transform, df0):
+        df = df0.copy()
+        self.fnames_dict = data
+        self.fnames_list = data
+        self.is_dict = isinstance(data, dict)
+        if self.is_dict:
+            self.fnames_list = list(data.keys())
+
+        '''
         counts = Counter(df.Id.values)
         df['c'] = df['Id'].apply(lambda x: counts[x])
         # in the production runs df.c>1 should be used
@@ -178,6 +237,7 @@ class pdFilesDataset(FilesDataset):
         l1 = 1 + df.label.max()
         l2 = len(df[df.label == 0])
         df.loc[df.label == 0, 'label'] = range(l1, l1 + l2)  # assign unique ids
+        '''
         self.labels = df.copy().set_index('Image')
         self.names = df.copy().set_index('label')
         if path == TRAIN:
@@ -192,10 +252,15 @@ class pdFilesDataset(FilesDataset):
         else:
             self.loader = Loader(path)
         self.selection = None
-        super().__init__(fnames, transform, path)
+        super().__init__(self.fnames_list, transform, path)
 
     def get_x(self, i):
-        label = self.labels.loc[self.fnames[i], 'label']
+        while True:
+            label = self.labels.loc[self.fnames_list[i], 'label']
+            if label != 5004:
+                break
+            else:
+                i = np.random.randint(len(self.fnames_list))
         # random selection of a positive example
         for j in range(10):  # sometimes loc call fails
             try:
@@ -203,19 +268,20 @@ class pdFilesDataset(FilesDataset):
                 break
             except:
                 None
-        name_p = names if isinstance(names, str) else random.sample(set(names) - set([self.fnames[i]]), 1)[0]
+        name_p = names if isinstance(names, str) else random.sample(set(names) - set([self.fnames_list[i]]), 1)[0]
+
         # random selection of a negative example
-        if (self.selection == None):
+        if not self.is_dict:
             for j in range(10):  # sometimes loc call fails
                 try:
                     names = self.names.loc[self.names.index != label].Image
                     break
                 except:
-                    names = self.fnames[i]
+                    names = self.fnames_list[i]
             name_n = names if isinstance(names, str) else names.sample(1).values[0]
         else:
-            name_n = self.selection.get(self.fnames[i])
-        imgs = [self.loader(os.path.join(self.path, self.fnames[i])),
+            name_n = random.choice(self.fnames_dict[self.fnames_list[i]])
+        imgs = [self.loader(os.path.join(self.path, self.fnames_list[i])),
                 self.loader(os.path.join(self.path, name_p)),
                 self.loader(os.path.join(self.path, name_n)),
                 label, label, self.labels.loc[name_n, 'label']]
@@ -257,7 +323,7 @@ class pdFilesDataset(FilesDataset):
         return n_embedding
 
     def get_n(self):
-        return len(self.fnames)
+        return len(self.fnames_list)
 
 
 # class for loading an individual images when embedding is computed
@@ -285,6 +351,97 @@ class FilesDataset_single(FilesDataset):
     def get_n(self): return len(self.fnames)
 
 
+class FileDs(FilesDataset):
+    def __init__(self, data, path, transform, df0):
+        self.df0 = df0
+        self.fnames_dict = data
+        self.fnames_list = data
+        self.is_dict = isinstance(data, dict)
+        if self.is_dict:
+            self.fnames_list = list(data.keys())
+        self.labels = df0.set_index('Image')
+        if path == TRAIN:
+            # data augmentation: 8 degree rotation, 10% stratch, shear
+            tfms_g = [iaa.Affine(rotate=(-8, 8), mode='reflect',
+                                 scale={"x": (0.9, 1.1), "y": (0.9, 1.1)}, shear=(-16, 16))]
+            # data augmentation: horizontal flip, hue and staturation augmentation,
+            # gray scale, blur
+            tfms_px = [iaa.Fliplr(0.5), iaa.AddToHueAndSaturation((-20, 20)),
+                       iaa.Grayscale(alpha=(0.0, 1.0)), iaa.GaussianBlur((0, 1.0))]
+            self.loader = Loader(path, tfms_g, tfms_px)
+        else:
+            self.loader = Loader(path)
+        self.selection = None
+        super().__init__(self.fnames_list, transform, path)
+
+    def get_x(self, i):
+        label = self.labels.loc[self.fnames_list[i], 'label']
+        imgs = [self.loader(os.path.join(self.path, self.fnames_list[i])), label]
+        return imgs
+
+    def get_y(self, i):
+        return 0
+
+    def get(self, tfm, x, y):
+        if tfm is None:
+            return (*x, 0)
+        else:
+            x1, y1 = tfm(x[0], x[1])
+            return x1, y1
+
+    def get_names(self, label):
+        names = []
+        for j in range(10):
+            try:
+                names = self.names.loc[label].Image
+                break
+            except:
+                None
+        return names
+
+    @property
+    def is_multi(self):
+        return True
+
+    @property
+    def is_reg(self):
+        return True
+
+    def get_c(self):
+        return n_embedding
+
+    def get_n(self):
+        return len(self.fnames_list)
+
+
+class FileDs1(FilesDataset):
+    def __init__(self, data, path, transform):
+        self.loader = Loader(path)
+        #fnames = os.listdir(path)
+        if data is None:
+            fnames = sorted(list(Path(path).glob('*.jpg')))
+        elif isinstance(data, pd.DataFrame):
+            fnames = sorted(data.Image.to_list())
+        elif isinstance(data, list):
+            fnames = sorted(data)
+        super().__init__(fnames, transform, path)
+
+    def get_x(self, i):
+        return self.loader(os.path.join(self.path, self.fnames[i]))
+
+    def get_y(self, i):
+        return 0
+
+    @property
+    def is_multi(self): return True
+
+    @property
+    def is_reg(self): return True
+
+    def get_c(self): return n_embedding
+
+    def get_n(self): return len(self.fnames)
+
 # In[13]:
 
 def get_data(sz, bs, fname_emb=None, model=None):
@@ -303,7 +460,154 @@ def get_data(sz, bs, fname_emb=None, model=None):
     return md
 
 
-# The image below demonstrates an example of triplets of rectangular 576x192 augmented images used for training. To be honest, some of those triplets are quite hard, and I don't think that I could even reach the same performance as the model after training (~99% accuracy in identifications of 2 similar images in a triplet). 
+def build_data(sz, bs, train_set, val_set, df0, fname_emb=None, model=None):
+    tfms = tfms_from_model(resnet34, sz, crop_type=CropType.NO)
+    tfms[0].tfms = [tfms[0].tfms[2], tfms[0].tfms[3]]
+    tfms[1].tfms = [tfms[1].tfms[2], tfms[1].tfms[3]]
+    #ds = ImageData.get_ds(FileDs1, (trn_df, TRAIN), (val_df, TRAIN), tfms, test=(None, TEST))
+    #md = ImageData(PATH, ds, bs, num_workers=nw, classes=None)
+
+    ds = ImageData.get_ds(pdFilesDataset, (train_set, TRAIN), (val_set, TRAIN), tfms, df0=df0)
+    md = ImageData(PATH, ds, bs, num_workers=nw, classes=None)
+
+    ds1 = ImageData.get_ds(FileDs, (train_set, TRAIN), (val_set, TRAIN), tfms, df0=df0)#, test=(None, TEST))
+    md1 = ImageData(PATH, ds1, bs, num_workers=nw, classes=None)
+
+    '''
+    if fname_emb != None and model != None:
+        print('selecting samples')
+        emb = pd.read_csv(fname_emb)
+        md.trn_dl.dataset.selection = Image_selection(train_set, df0, emb, model)
+        md.val_dl.dataset.selection = Image_selection(val_set, df0, emb, model)
+    '''
+    return md, md1
+
+
+def idx2label(ds):
+    labels = []
+    for k, fname in enumerate(ds.fnames):
+        labels.append(ds.labels.loc[fname, 'label'])
+    return labels
+
+
+class CbBoost(Callback):
+    def __init__(self, learn):
+        super().__init__()
+        self.learn = learn
+        self.train_labels = idx2label(self.learn.data1.trn_ds)
+        self.val_labels = idx2label(self.learn.data1.val_ds)
+
+    def on_epoch_end(self, none) -> None:
+    #def on_batch_end(self, none) -> None:
+        print('************************************* Boosting ****************************************')
+        print(now2str())
+        print('Calculating map5 in validation set ...')
+        if 1:
+            met_mat = cal_ds_metrics(self.learn.model, self.learn.data1.val_dl)
+        else:
+            with open('metmat.dump', 'rb') as f:
+                met_mat = pickle.load(f)
+        map5 = cal_map_score(met_mat, self.val_labels, threshold=0.7)
+        print(f'Validation set, map5 = {map5}')
+
+        print(now2str())
+        print('Finding wrong images in train set ... ')
+        if 1:
+            met_mat = cal_ds_metrics(self.learn.model, self.learn.data1.trn_dl)
+            #with open('metmat_trn.dump', 'wb') as f:
+            #    pickle.dump(met_mat, f)
+        else:
+            with open('metmat_trn.dump', 'rb') as f:
+                met_mat = pickle.load(f)
+        wrong_dict = find_wrong_files(met_mat, self.learn.data1.trn_ds, self.train_labels)
+        self.learn.data_, _ = build_data(sz, bs, wrong_dict, self.learn.val_list, df0=self.learn.df0)
+        print(now2str())
+        print(f'Wrong dict size {len(wrong_dict)}.')
+        with open('wrong_dict.dump', 'wb') as f:
+            pickle.dump(wrong_dict, f)
+        print('\n')
+
+
+
+def cal_ds_metrics(model, dl):
+    emb, names = cal_emb(model, dl)
+    emb_size = emb.shape[0]
+    metric_list = []
+    model.eval()
+    with torch.no_grad():
+        for k in (range(emb_size)):
+            emb_row = emb[k].expand((*(emb.shape)))
+            metric = model.get_d(emb_row, emb)
+            metric_list.append(metric.view(-1))
+    metrics = torch.stack(metric_list)
+    return metrics
+
+def cal_map_score(met_mat, labels, mapn=5, threshold=0.7):
+    new_whale_label = 5004
+    sorted, indices = torch.topk(met_mat, 64, dim=1, largest=False)
+    col_len, row_len = met_mat.shape
+    scores = np.zeros(col_len)
+    for idx in range(col_len):
+        ref_label = labels[idx]
+        cnt = 0
+        score = 0.0
+        for k in range(row_len):
+            cur_k = indices[idx, k]
+            cur_value = sorted[idx, k]
+            if cur_k == idx:
+                continue
+
+            cur_label = labels[cur_k]
+            if cur_value > threshold:
+                cur_label = new_whale_label
+
+            if ref_label == cur_label:
+                score = 1.0 / (cnt + 1)
+                break
+            else:
+                cnt += 1
+                if cnt >= mapn:
+                    break
+        scores[idx] = score
+    return scores.mean()
+
+def find_wrong_files(met_mat, ds, labels):
+    #metrics = cal_ds_metrics(model, dl)
+    sorted, indices = torch.topk(met_mat, 64, dim=1, largest=False)
+    col_len, row_len = sorted.shape
+    wrong_idxes = []
+    wrong_dict = {}
+    for idx in range(col_len):
+        ref_label = labels[idx]
+        for k in range(row_len):
+            cur_k = indices[idx, k]
+            if cur_k == idx:
+                continue
+
+            cur_label = labels[cur_k]
+            if cur_label != ref_label:
+                #print(idx, ds.fnames_list[idx])
+                if ds.fnames_list[idx] not in wrong_dict:
+                    wrong_dict[ds.fnames_list[idx]] = [ds.fnames[cur_k.item()]]
+                else:
+                    wrong_dict[ds.fnames_list[idx]].append(ds.fnames[cur_k.item()])
+            else:
+                break
+    return wrong_dict
+
+    '''
+    #emb, names = cal_emb(self.learn.model, self.learn.data.trn_dl)
+    wrong_idxes = list(set(wrong_idxes))
+    wrong_fnames = []
+    for idx in wrong_idxes:
+        #print(len(wrong_idxes), k)
+        wrong_fnames.append(ds.fnames[idx])
+
+    return wrong_fnames
+    '''
+
+
+# The image below demonstrates an example of triplets of rectangular 576x192 augmented images used for training. To be honest, some of those triplets are quite hard, and I don't think that I could even reach the same performance as the model after training (~99% accuracy in identifications of 2 similar images in a triplet).
 
 # In[14]:
 
@@ -334,12 +638,13 @@ class Metric(nn.Module):
     def __init__(self, emb_sz=64):
         super().__init__()
         self.l = nn.Linear(emb_sz * 2, emb_sz * 2, False)
+        self.fc = nn.Linear(emb_sz * 2, 1)
 
     def forward(self, d):
         d2 = d.pow(2)
         d = self.l(torch.cat((d, d2), dim=-1))
-        x = d.pow(2).sum(dim=-1)
-        return x.view(-1)
+        logits = self.fc(d)
+        return torch.sigmoid(logits)
 
 
 # In[16]:
@@ -521,6 +826,41 @@ class DenseNet121Model():
 
 # In[19]:
 
+class BinaryLoss(nn.Module):
+    def __init__(self, wd=1e-4):
+        super().__init__()
+        self.wd =  wd
+
+    def forward(self, d, target):
+        if isinstance(target, list):
+            target = torch.cat(target)
+        #d = d.float()
+        d = d.view(-1)
+        # matrix of all vs all comparisons
+        #t = torch.cat(target)
+        t = target
+        sz = t.shape[0]
+        t1 = t.unsqueeze(1).expand((sz, sz))
+        t2 = t1.transpose(0, 1)
+        y = ((t1 != t2) + to_gpu(torch.eye(sz).byte())).view(-1)
+        #y = y.half()
+        y = y.float()
+
+        loss_p = None
+        if len(y[y==0]):
+            loss_p = F.binary_cross_entropy(d[y==0], y[y==0])
+
+        loss_n = None
+        if len(y[y==1]):
+            loss_n = F.binary_cross_entropy(d[y==1], y[y==1])
+
+        if loss_p is None:
+            return loss_n
+
+        loss = (loss_p + loss_n) / 2
+        return loss
+
+
 class Contrastive_loss(nn.Module):
     def __init__(self, m=10.0, wd=1e-4):
         super().__init__()
@@ -664,6 +1004,20 @@ def extract_embedding(model, path):
             preds[start:start + size, :] = m.get_embedding(x.half())
             start += size
         return preds, [os.path.basename(name) for name in md.test_dl.dataset.fnames]
+
+def cal_emb(model, dl):
+    model.eval()
+    with torch.no_grad():
+        preds = torch.zeros((len(dl.dataset), n_embedding))
+        start = 0
+        #for i, (x, y) in tqdm(enumerate(dl, start=0), total=len(dl)):
+        for i, (x, y) in enumerate(dl):
+            #print(i)
+            size = x.shape[0]
+            m = model.module if isinstance(model, FP16) else model
+            preds[start:start + size, :] = m.get_embedding(x)
+            start += size
+        return preds, [os.path.basename(name) for name in dl.dataset.fnames]
 
 
 # ### **Validation**
