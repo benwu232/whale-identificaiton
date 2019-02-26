@@ -93,12 +93,11 @@ learner.data1 = md1
 #learner.half()
 #md = get_data(sz, bs, 'train_emb.csv', learner.model)
 
-cb_boost = CbBoost(learner)
 if not fine_tuning:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         #learner.half()
-        learner.fit(lr, 2, callbacks=[cb_boost])
+        learner.fit(lr, 2)
         model_file = 'model0'
         print(f'saving {model_file}')
         learner.save(model_file)
@@ -107,7 +106,8 @@ else:
 
 if 1:
     learner.unfreeze()  # unfreeze entire model
-    #learner.half()  # half precision
+    learner.half()  # half precision
+    cb_boost = CbBoost(learner)
 
     # **Since the loss is calculated as an average of nonzero terms, as mentioned above, it's value is not relaiable and must be ignored.** Instead the values of T_acc and BH_acc metrics should be considered.
 

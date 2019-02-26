@@ -46,10 +46,13 @@ contrastive_neg_margin = 10.0
 n_embedding = 512
 #bs = 32
 bs = 5
-bs = 13
+bs = 26
 sz = 384 # increase the image size at the later stage of training
 sz = 224  # increase the image size at the later stage of training
 nw = 6
+
+USE_CUDA = torch.cuda.is_available()
+device = torch.device("cuda" if USE_CUDA else "cpu")
 
 new_whale_id = 'z_new_whale'
 
@@ -497,8 +500,8 @@ class CbBoost(Callback):
         self.train_labels = idx2label(self.learn.data1.trn_ds)
         self.val_labels = idx2label(self.learn.data1.val_ds)
 
-    def on_epoch_end(self, none) -> None:
-    #def on_batch_end(self, none) -> None:
+    #def on_epoch_end(self, none) -> None:
+    def on_batch_end(self, none) -> None:
         print('************************************* Boosting ****************************************')
         print(now2str())
         print('Calculating map5 in validation set ...')
@@ -535,9 +538,10 @@ def cal_ds_metrics(model, dl):
     metric_list = []
     model.eval()
     with torch.no_grad():
+        m = model.module if isinstance(model, FP16) else model
         for k in (range(emb_size)):
             emb_row = emb[k].expand((*(emb.shape)))
-            metric = model.get_d(emb_row, emb)
+            metric = m.get_d(emb_row, emb)
             metric_list.append(metric.view(-1))
     metrics = torch.stack(metric_list)
     return metrics
@@ -843,8 +847,8 @@ class BinaryLoss(nn.Module):
         t1 = t.unsqueeze(1).expand((sz, sz))
         t2 = t1.transpose(0, 1)
         y = ((t1 != t2) + to_gpu(torch.eye(sz).byte())).view(-1)
-        #y = y.half()
-        y = y.float()
+        y = y.half()
+        #y = y.float()
 
         loss_p = None
         if len(y[y==0]):
@@ -1008,14 +1012,14 @@ def extract_embedding(model, path):
 def cal_emb(model, dl):
     model.eval()
     with torch.no_grad():
-        preds = torch.zeros((len(dl.dataset), n_embedding))
+        preds = torch.zeros((len(dl.dataset), n_embedding), dtype=torch.float16, device=device)
         start = 0
         #for i, (x, y) in tqdm(enumerate(dl, start=0), total=len(dl)):
         for i, (x, y) in enumerate(dl):
             #print(i)
             size = x.shape[0]
             m = model.module if isinstance(model, FP16) else model
-            preds[start:start + size, :] = m.get_embedding(x)
+            preds[start:start + size, :] = m.get_embedding(x.half())
             start += size
         return preds, [os.path.basename(name) for name in dl.dataset.fnames]
 
